@@ -9,6 +9,7 @@ use esp_hal::i2c::master::{Config, I2c};
 use esp_hal::time::Rate;
 use esp_hal::timer::systimer::SystemTimer;
 use esp_hal::timer::timg::TimerGroup;
+use magic_markers::led::led_task;
 use magic_markers::rfid::rfid_task;
 use mfrc522::comm::blocking::i2c::I2cInterface;
 use mfrc522::Mfrc522;
@@ -45,7 +46,7 @@ async fn main(spawner: Spawner) {
     .unwrap();
 
     // Turn on LED
-    let mut led = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
+    let mut led: Output<'_> = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
     led.set_low();
 
     // RFID reader
@@ -66,7 +67,7 @@ async fn main(spawner: Spawner) {
     };
     i2c = i2c.with_sda(sda).with_scl(scl);
     let itf = I2cInterface::new(i2c, 0x28);
-    let mfrc522 = match Mfrc522::new(itf).init() {
+    let mut mfrc522 = match Mfrc522::new(itf).init() {
         Ok(mfrc522) => mfrc522,
         Err(e) => match e {
             mfrc522::Error::Comm(c) => {
@@ -79,6 +80,14 @@ async fn main(spawner: Spawner) {
             }
         },
     };
+    match mfrc522.set_antenna_gain(mfrc522::RxGain::DB48) {
+        Ok(()) => info!("antenna gain set"),
+        Err(_) => {
+            error!("failed to set antenna gain");
+            panic!();
+        }
+    }
 
     spawner.spawn(rfid_task(mfrc522)).unwrap();
+    spawner.spawn(led_task(led)).unwrap();
 }

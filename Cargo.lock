@@ -989,6 +989,7 @@ dependencies = [
  "defmt 0.3.100",
  "embassy-executor",
  "embassy-net",
+ "embassy-sync",
  "embassy-time",
  "embedded-hal-bus",
  "embedded-io",
