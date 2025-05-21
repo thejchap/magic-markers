@@ -80,6 +80,12 @@ async fn main(spawner: Spawner) {
             }
         },
     };
+    if let Ok(version) = mfrc522.version() {
+        info!("mfrc522 version: {:?}", version);
+    } else {
+        error!("mfrc522 version error");
+        panic!();
+    }
     match mfrc522.set_antenna_gain(mfrc522::RxGain::DB48) {
         Ok(()) => info!("antenna gain set"),
         Err(_) => {
