@@ -1,6 +1,30 @@
 #![no_std]
 #![no_main]
 
+//! # control an led smart bulb using a set of crayola markers!
+//! inspired by [this reel](https://www.instagram.com/reel/DIE2O59Svcz/?igsh=MXNnbmJsZWRmcHhlNA%3D%3D)
+//!
+//! # how it works
+//! the markers have a unique rfid tag, which is read by an rfid reader
+//! color changes post a command directly to the led smart bulb via an http request to the tasmota command endpoint
+//!
+//! # resources
+//! - [tasmota light docs](https://tasmota.github.io/docs/Lights/#3-channels-rgb-lights)
+//! - [tasmota commands](https://tasmota.github.io/docs/Lights/#3-channels-rgb-lights)
+//! - [tasmota firmware](https://github.com/arendst/Tasmota-firmware/tree/firmware/release-firmware/tasmota)
+//! - [markers](https://www.amazon.com/dp/B003HGGPLW)
+//! - [rfid reader](https://shop.m5stack.com/products/rfid-unit-2-ws1850s?srsltid=AfmBOop6K8L69siyTW5ufYZakI-9S1a9My58NNKoWxzAvqqJq6W6jRW3)
+//! - [nanoc6 examples](https://www.amazon.com/dp/B0B3XQ5Z6F)
+//! - [nanoc6 docs](https://docs.m5stack.com/en/core/M5NanoC6)
+//!
+//! # tasmota commands
+//!
+//! ```bash
+//! # change color
+//! curl -X POST "http://192.168.0.102/cm?cmnd=HSBColor%20255,255,255"
+//! ```
+
+/// This module makes it easy.
 use core::net::{Ipv4Addr, SocketAddrV4};
 use core::{
     str::FromStr,
@@ -183,7 +207,6 @@ async fn main(spawner: Spawner) {
     let scl = peripherals.GPIO1;
 
     // communicates via i2c protocol
-    // https://shop.m5stack.com/products/rfid-unit-2-ws1850s?srsltid=AfmBOop6K8L69siyTW5ufYZakI-9S1a9My58NNKoWxzAvqqJq6W6jRW3
     let mut i2c = match I2c::new(
         peripherals.I2C0,
         // 100khz is i2c standard
@@ -311,6 +334,7 @@ async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
     runner.run().await
 }
 
+/// task for managing wifi connection
 #[embassy_executor::task]
 async fn connection_task(mut controller: WifiController<'static>) {
     loop {
@@ -331,6 +355,7 @@ async fn connection_task(mut controller: WifiController<'static>) {
     }
 }
 
+/// task for listening for http requests
 #[embassy_executor::task]
 async fn listener_task(stack: Stack<'static>) {
     info!("starting listener task");
@@ -408,6 +433,7 @@ async fn listener_task(stack: Stack<'static>) {
     }
 }
 
+/// task for running dhcp server
 #[embassy_executor::task]
 async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
     info!("starting dhcp task");
@@ -454,6 +480,7 @@ fn marker_detected(color: MarkerColor) {
     info!("color update: {:?}", color);
 }
 
+/// clears the last marker color and resets the updated at timestamp
 fn reset_marker_color() {
     LAST_MARKER_COLOR.store(0, Ordering::Relaxed);
     LAST_MARKER_COLOR_UPDATED_AT.store(Instant::now().as_millis() as u32, Ordering::Relaxed);
