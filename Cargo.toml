@@ -11,6 +11,7 @@ path = "./src/bin/main.rs"
 defmt = "0.3.10"
 embassy-net = { version = "0.6.0", features = [
     "dhcpv4",
+    "dns",
     "medium-ethernet",
     "tcp",
     "udp",
@@ -62,9 +63,7 @@ static_cell = { version = "2.1.0", features = ["nightly"] }
 mfrc522 = "0.8.0"
 embedded-hal-bus = "0.3.0"
 embassy-sync = "0.6.2"
-edge-nal = "0.5.0"
-edge-nal-embassy = "0.5.0"
-edge-dhcp = "0.5.0"
+reqwless = { version = "0.13.0", features = ["defmt"] }
 
 [profile.dev]
 # Rust debug is too slow.

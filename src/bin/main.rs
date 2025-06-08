@@ -22,23 +22,32 @@
 //! ```bash
 //! # change color
 //! curl -X POST "http://192.168.0.102/cm?cmnd=HSBColor%20255,255,255"
+//!
+//! # set static ip
+//! curl -X POST "http://192.168.0.102/cm?cmnd=ipaddress1%20192.168.2.2"
+//! curl -X POST "http://192.168.0.102/cm?cmnd=ipaddress2%20255.255.255.0"
+//! curl -X POST "http://192.168.0.102/cm?cmnd=ipaddress3%20192.168.2.1"
+//! curl -X POST "http://192.168.0.102/cm?cmnd=restart%201"
 //! ```
+//!
+//! # networking
+//! the rfid reader is connected to an esp32 dev kit, which starts a wifi access point
+//! it expects the bulb to be connected to its network with a static ip:
+//! - ip: 192.168.2.2
+//! - subnet: 255.255.255.0
+//! - gateway: 192.168.2.0
 
-/// This module makes it easy.
-use core::net::{Ipv4Addr, SocketAddrV4};
+use alloc::format;
+use core::net::Ipv4Addr;
 use core::{
     str::FromStr,
     sync::atomic::{AtomicU32, AtomicU8, Ordering},
 };
-use defmt::{debug, error, info, warn, Format};
-use edge_dhcp::{
-    io::{self, DEFAULT_SERVER_PORT},
-    server::{Server, ServerOptions},
-};
-use edge_nal::UdpBind;
-use edge_nal_embassy::{Udp, UdpBuffers};
+use defmt::{debug, error, info, Format};
 use embassy_executor::Spawner;
-use embassy_net::{tcp::TcpSocket, IpListenEndpoint, Ipv4Cidr, Runner, Stack, StaticConfigV4};
+use embassy_net::tcp::client::{TcpClient, TcpClientState};
+use embassy_net::tcp::TcpSocket;
+use embassy_net::{IpListenEndpoint, Ipv4Cidr, Runner, Stack, StaticConfigV4};
 use embassy_time::{Duration, Instant, Timer};
 use embedded_io_async::Write;
 use esp_hal::{
@@ -53,6 +62,8 @@ use esp_wifi::wifi::{
     AccessPointConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState,
 };
 use mfrc522::{comm::blocking::i2c::I2cInterface, GenericUid, Initialized, Mfrc522, Uid};
+use reqwless::client::HttpClient;
+use reqwless::request::Method;
 use static_cell::StaticCell;
 extern crate alloc;
 
@@ -178,6 +189,7 @@ async fn main(spawner: Spawner) {
     let (ctrl, interfaces) = esp_wifi::wifi::new(init, peripherals.WIFI).unwrap();
     let device = interfaces.ap;
     let gw_ip_addr_str = "192.168.2.1";
+    let bulb_ip_addr_str = "192.168.2.2";
     let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).expect("failed to parse gateway ip");
     let config = embassy_net::Config::ipv4_static(StaticConfigV4 {
         address: Ipv4Cidr::new(gw_ip_addr, 24),
@@ -259,8 +271,8 @@ async fn main(spawner: Spawner) {
     spawner.spawn(button_task(button)).unwrap();
     spawner.spawn(connection_task(ctrl)).unwrap();
     spawner.spawn(net_task(runner)).unwrap();
-    spawner.spawn(run_dhcp(stack, gw_ip_addr_str)).unwrap();
-    spawner.spawn(listener_task(stack)).unwrap();
+    spawner.spawn(web_task(stack, bulb_ip_addr_str)).unwrap();
+    // spawner.spawn(listener_task(stack, gw_ip_addr_str)).unwrap();
 }
 
 // tasks
@@ -330,7 +342,7 @@ async fn rfid_task(mut mfrc522: Mfrc522<I2cInterface<I2c<'static, Blocking>>, In
 
 #[embassy_executor::task]
 async fn net_task(mut runner: Runner<'static, WifiDevice<'static>>) {
-    info!("starting net task");
+    info!("starting net task...");
     runner.run().await
 }
 
@@ -357,7 +369,7 @@ async fn connection_task(mut controller: WifiController<'static>) {
 
 /// task for listening for http requests
 #[embassy_executor::task]
-async fn listener_task(stack: Stack<'static>) {
+async fn listener_task(stack: Stack<'static>, gw_ip_addr: &'static str) {
     info!("starting listener task");
     let mut rx_buffer = [0; 1536];
     let mut tx_buffer = [0; 1536];
@@ -367,7 +379,10 @@ async fn listener_task(stack: Stack<'static>) {
         }
         Timer::after(Duration::from_millis(500)).await;
     }
-    info!("connect to the `magic-markers` network and visit http://192.168.2.1:8080");
+    info!(
+        "connect to the `magic-markers` network and visit http://{}",
+        gw_ip_addr
+    );
     while !stack.is_config_up() {
         Timer::after(Duration::from_millis(100)).await
     }
@@ -377,7 +392,7 @@ async fn listener_task(stack: Stack<'static>) {
         let r = socket
             .accept(IpListenEndpoint {
                 addr: None,
-                port: 8080,
+                port: 80,
             })
             .await;
         info!("http request");
@@ -385,6 +400,11 @@ async fn listener_task(stack: Stack<'static>) {
             info!("connect error");
             continue;
         }
+        // if let Some(remote_endpoint) = socket.remote_endpoint() {
+        //     match remote_endpoint.addr {
+        //         Address::Ipv4(addr) => info!("client (ipv4): {:?}", addr.octets()),
+        //     }
+        // }
         let mut buffer = [0u8; 1024];
         let mut pos = 0;
         loop {
@@ -425,40 +445,64 @@ async fn listener_task(stack: Stack<'static>) {
         let r = socket.flush().await;
         if r.is_err() {
             info!("flush error");
+            Timer::after(Duration::from_millis(1000)).await;
+            socket.close();
+            Timer::after(Duration::from_millis(1000)).await;
+            socket.abort();
         }
-        Timer::after(Duration::from_millis(1000)).await;
-        socket.close();
-        Timer::after(Duration::from_millis(1000)).await;
-        socket.abort();
     }
 }
 
-/// task for running dhcp server
 #[embassy_executor::task]
-async fn run_dhcp(stack: Stack<'static>, gw_ip_addr: &'static str) {
-    info!("starting dhcp task");
-    let ip = Ipv4Addr::from_str(gw_ip_addr).expect("dhcp task failed to parse gw ip");
-    let mut buf = [0u8; 1500];
-    let mut gw_buf = [Ipv4Addr::UNSPECIFIED];
-    let buffers = UdpBuffers::<3, 1024, 1024, 10>::new();
-    let unbound_socket = Udp::new(stack, &buffers);
-    let mut bound_socket = unbound_socket
-        .bind(core::net::SocketAddr::V4(SocketAddrV4::new(
-            Ipv4Addr::UNSPECIFIED,
-            DEFAULT_SERVER_PORT,
-        )))
-        .await
-        .unwrap();
+pub async fn web_task(stack: Stack<'static>, bulb_ip_addr_str: &'static str) {
+    info!("starting web task...");
+    while !stack.is_config_up() {
+        Timer::after_millis(100).await;
+    }
+    while !stack.is_link_up() {
+        Timer::after_millis(500).await;
+    }
+    stack.wait_config_up().await;
+    let state = TcpClientState::<1, 4096, 4096>::new();
+    let mut tcp_client = TcpClient::new(stack, &state);
+    tcp_client.set_timeout(Some(Duration::from_secs(5)));
+    let dns_client = embassy_net::dns::DnsSocket::new(stack);
+    let mut client = HttpClient::new(&tcp_client, &dns_client);
+    let mut buffer = [0u8; 4096];
+    let url = format!("http://192.169.2.2");
     loop {
-        _ = io::server::run(
-            &mut Server::<_, 64>::new_with_et(ip),
-            &ServerOptions::new(ip, Some(&mut gw_buf)),
-            &mut bound_socket,
-            &mut buf,
-        )
-        .await
-        .inspect_err(|_| warn!("dhcp server error"));
-        Timer::after(Duration::from_millis(500)).await;
+        info!("sending request to: {}", url.as_str());
+        match client.request(Method::GET, url.as_str()).await {
+            Ok(ref mut req) => match req.send(&mut buffer).await {
+                Ok(res) => {
+                    info!("request sent successfully");
+                    match res.body().read_to_end().await {
+                        Ok(read) => {
+                            info!("response body read successfully, length: {}", read.len());
+                            match core::str::from_utf8(read) {
+                                Ok(body) => {
+                                    info!("response body: {:?}", body);
+                                }
+                                Err(_) => info!("response body is not valid UTF-8"),
+                            }
+                        }
+                        Err(e) => {
+                            info!("failed to read response body: {:?}", e);
+                        }
+                    }
+                }
+                Err(e) => {
+                    info!("request send error: {:?}", e);
+                    return;
+                }
+            },
+            Err(e) => {
+                info!("request build error: {:?}", e);
+                Timer::after(Duration::from_secs(2)).await;
+                continue;
+            }
+        }
+        Timer::after(Duration::from_secs(2)).await;
     }
 }
 
