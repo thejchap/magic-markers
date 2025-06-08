@@ -350,7 +350,10 @@ async fn rfid_task(mut mfrc522: Mfrc522<I2cInterface<I2c<'static, Blocking>>, In
             match mfrc522.select(&atqa) {
                 Ok(Uid::Double(inner)) => {
                     if let Some(marker_color) = MarkerColor::from_uid(&inner) {
+                        info!("detected color: {}", marker_color);
                         marker_detected(marker_color);
+                    } else {
+                        info!("unknown marker uid: {}", inner.as_bytes());
                     }
                 }
                 Ok(_) => info!("wrong uid size"),
@@ -518,10 +521,12 @@ pub async fn tasmota_commands_task(stack: Stack<'static>, bulb_ip_addr_str: &'st
     let client = HTTP_CLIENT_INIT.init(HttpClient::new(tcp_client, dns_client));
     let mut buffer = [0u8; 4096];
     loop {
-        send_tasmota_command(client, &mut buffer, bulb_ip_addr_str, "power%20on").await;
-        Timer::after(Duration::from_millis(500)).await;
+        // send_tasmota_command(client, &mut buffer, bulb_ip_addr_str, "power%20on").await;
         let current_color_u8 = LAST_MARKER_COLOR.load(Ordering::Relaxed);
+        info!("current color u8: {}", current_color_u8);
         let Ok(current_color): Result<MarkerColor, _> = current_color_u8.try_into() else {
+            send_tasmota_command(client, &mut buffer, bulb_ip_addr_str, "hsbcolor%200,0,0").await;
+            Timer::after(Duration::from_millis(500)).await;
             continue;
         };
         let hsb = current_color.hsb();
@@ -533,6 +538,7 @@ pub async fn tasmota_commands_task(stack: Stack<'static>, bulb_ip_addr_str: &'st
 
 // helpers
 
+/// send a command to the tasmota bulb
 async fn send_tasmota_command(
     client: &mut HttpClient<
         'static,
@@ -578,13 +584,6 @@ async fn send_tasmota_command(
 /// if it's the same marker as the current one, do nothing
 /// otherwise set updated at and set the current marker to the new one
 fn marker_detected(color: MarkerColor) {
-    let current_color_u8 = LAST_MARKER_COLOR.load(Ordering::Relaxed);
-    let Ok(current_color): Result<MarkerColor, _> = current_color_u8.try_into() else {
-        return;
-    };
-    if current_color == color {
-        return;
-    }
     LAST_MARKER_COLOR.store(color.clone() as u8, Ordering::Relaxed);
     LAST_MARKER_COLOR_UPDATED_AT.store(Instant::now().as_millis() as u32, Ordering::Relaxed);
     info!("color update: {:?}", color);
