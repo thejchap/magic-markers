@@ -16,6 +16,7 @@
 //! - [rfid reader](https://shop.m5stack.com/products/rfid-unit-2-ws1850s?srsltid=AfmBOop6K8L69siyTW5ufYZakI-9S1a9My58NNKoWxzAvqqJq6W6jRW3)
 //! - [nanoc6 examples](https://www.amazon.com/dp/B0B3XQ5Z6F)
 //! - [nanoc6 docs](https://docs.m5stack.com/en/core/M5NanoC6)
+//! - [esp hal wifi embassy access point example] https://github.com/esp-rs/esp-hal/blob/main/examples/src/bin/wifi_embassy_access_point.rs
 //!
 //! # tasmota commands
 //!
@@ -43,7 +44,7 @@ use core::{
     str::FromStr,
     sync::atomic::{AtomicU32, AtomicU8, Ordering},
 };
-use defmt::{debug, error, info, Format};
+use defmt::{debug, error, info, warn, Format};
 use embassy_executor::Spawner;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::tcp::TcpSocket;
@@ -178,8 +179,6 @@ async fn main(spawner: Spawner) {
     info!("embassy initialized");
 
     // initialize wifi
-    // https://github.com/esp-rs/esp-hal/blob/main/examples/src/bin/wifi_embassy_access_point.rs
-    // https://tasmota.github.io/docs/Commands/#with-web-requests
     static WIFI_INIT: StaticCell<esp_wifi::EspWifiController> = StaticCell::new();
     static RESOURCES: StaticCell<embassy_net::StackResources<3>> = StaticCell::new();
     let timer1 = TimerGroup::new(peripherals.TIMG0);
@@ -272,7 +271,9 @@ async fn main(spawner: Spawner) {
     spawner.spawn(connection_task(ctrl)).unwrap();
     spawner.spawn(net_task(runner)).unwrap();
     spawner.spawn(web_task(stack, bulb_ip_addr_str)).unwrap();
-    // spawner.spawn(listener_task(stack, gw_ip_addr_str)).unwrap();
+    // spawner
+    //     .spawn(http_server_task(stack, gw_ip_addr_str))
+    //     .unwrap();
 }
 
 // tasks
@@ -367,10 +368,9 @@ async fn connection_task(mut controller: WifiController<'static>) {
     }
 }
 
-/// task for listening for http requests
+/// serves a simple landing page
 #[embassy_executor::task]
-async fn listener_task(stack: Stack<'static>, gw_ip_addr: &'static str) {
-    info!("starting listener task");
+async fn http_server_task(stack: Stack<'static>, gw_ip_addr: &'static str) {
     let mut rx_buffer = [0; 1536];
     let mut tx_buffer = [0; 1536];
     loop {
@@ -380,49 +380,49 @@ async fn listener_task(stack: Stack<'static>, gw_ip_addr: &'static str) {
         Timer::after(Duration::from_millis(500)).await;
     }
     info!(
-        "connect to the `magic-markers` network and visit http://{}",
+        "connect to `magic-markers` and point your browser to http://{}:8080/",
         gw_ip_addr
     );
     while !stack.is_config_up() {
         Timer::after(Duration::from_millis(100)).await
     }
+    stack
+        .config_v4()
+        .inspect(|c| info!("ipv4 config: {}", c.address));
     let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
     socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
     loop {
+        info!("wait for connection...");
         let r = socket
             .accept(IpListenEndpoint {
                 addr: None,
-                port: 80,
+                port: 8080,
             })
             .await;
-        info!("http request");
-        if r.is_err() {
-            info!("connect error");
+        info!("connected...");
+        if let Err(e) = r {
+            warn!("connect error: {}", e);
             continue;
         }
-        // if let Some(remote_endpoint) = socket.remote_endpoint() {
-        //     match remote_endpoint.addr {
-        //         Address::Ipv4(addr) => info!("client (ipv4): {:?}", addr.octets()),
-        //     }
-        // }
         let mut buffer = [0u8; 1024];
         let mut pos = 0;
         loop {
             match socket.read(&mut buffer).await {
                 Ok(0) => {
-                    info!("read eof");
+                    info!("read EOF");
                     break;
                 }
                 Ok(len) => {
                     let to_print =
                         unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
                     if to_print.contains("\r\n\r\n") {
+                        info!("{}", to_print);
                         break;
                     }
                     pos += len;
                 }
-                Err(_) => {
-                    info!("read error");
+                Err(e) => {
+                    warn!("read error: {}", e);
                     break;
                 }
             };
@@ -432,24 +432,24 @@ async fn listener_task(stack: Stack<'static>, gw_ip_addr: &'static str) {
                 b"HTTP/1.0 200 OK\r\n\r\n\
             <html>\
                 <body>\
-                    <h1>magic-markers!</h1>\
+                    <h1>magic-markers</h1>\
+                    <p>connect a tasmota bulb to the `magic-markers` wifi network</p>\
                 </body>\
             </html>\r\n\
             ",
             )
             .await;
-        if r.is_err() {
-            info!("write error");
+        if let Err(e) = r {
+            warn!("write error: {}", e);
         }
-
         let r = socket.flush().await;
-        if r.is_err() {
-            info!("flush error");
-            Timer::after(Duration::from_millis(1000)).await;
-            socket.close();
-            Timer::after(Duration::from_millis(1000)).await;
-            socket.abort();
+        if let Err(e) = r {
+            info!("flush error: {:?}", e);
         }
+        Timer::after(Duration::from_millis(1000)).await;
+        socket.close();
+        Timer::after(Duration::from_millis(1000)).await;
+        socket.abort();
     }
 }
 
@@ -469,38 +469,35 @@ pub async fn web_task(stack: Stack<'static>, bulb_ip_addr_str: &'static str) {
     let dns_client = embassy_net::dns::DnsSocket::new(stack);
     let mut client = HttpClient::new(&tcp_client, &dns_client);
     let mut buffer = [0u8; 4096];
-    let url = format!("http://192.169.2.2");
+    let method = Method::POST;
+    let url = format!("http://{}/cm?cmnd=Power%20TOGGLE", bulb_ip_addr_str);
     loop {
-        info!("sending request to: {}", url.as_str());
-        match client.request(Method::GET, url.as_str()).await {
-            Ok(ref mut req) => match req.send(&mut buffer).await {
-                Ok(res) => {
-                    info!("request sent successfully");
-                    match res.body().read_to_end().await {
-                        Ok(read) => {
-                            info!("response body read successfully, length: {}", read.len());
-                            match core::str::from_utf8(read) {
-                                Ok(body) => {
-                                    info!("response body: {:?}", body);
-                                }
-                                Err(_) => info!("response body is not valid UTF-8"),
-                            }
-                        }
-                        Err(e) => {
-                            info!("failed to read response body: {:?}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    info!("request send error: {:?}", e);
-                    return;
-                }
-            },
+        info!("sending request: {} {}", method, url.as_str());
+        let mut req = match client.request(method, url.as_str()).await {
+            Ok(req) => req,
             Err(e) => {
                 info!("request build error: {:?}", e);
                 Timer::after(Duration::from_secs(2)).await;
                 continue;
             }
+        };
+        let res = match req.send(&mut buffer).await {
+            Ok(res) => res,
+            Err(e) => {
+                info!("request send error: {:?}", e);
+                return;
+            }
+        };
+        info!("request sent successfully");
+        match res.body().read_to_end().await {
+            Ok(read) => {
+                info!("response body read successfully, length: {}", read.len());
+                match core::str::from_utf8(read) {
+                    Ok(body) => info!("response body: {:?}", body),
+                    Err(_) => info!("response body is not valid UTF-8"),
+                }
+            }
+            Err(e) => info!("failed to read response body: {:?}", e),
         }
         Timer::after(Duration::from_secs(2)).await;
     }
