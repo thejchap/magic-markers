@@ -16,27 +16,30 @@
 //! - [rfid reader](https://shop.m5stack.com/products/rfid-unit-2-ws1850s?srsltid=AfmBOop6K8L69siyTW5ufYZakI-9S1a9My58NNKoWxzAvqqJq6W6jRW3)
 //! - [nanoc6 examples](https://www.amazon.com/dp/B0B3XQ5Z6F)
 //! - [nanoc6 docs](https://docs.m5stack.com/en/core/M5NanoC6)
-//! - [esp hal wifi embassy access point example] https://github.com/esp-rs/esp-hal/blob/main/examples/src/bin/wifi_embassy_access_point.rs
+//! - [esp hal wifi embassy access point example](https://github.com/esp-rs/esp-hal/blob/main/examples/src/bin/wifi_embassy_access_point.rs)
 //!
-//! # tasmota commands
+//! # tasmota
+//!
+//! ## template
+//!
+//! ```json
+//! {"NAME":"Kauf Bulb", "GPIO":[0,0,0,0,416,419,0,0,417,420,418,0,0,0], "FLAG":0, "BASE":18, "CMND":"SO105 1|RGBWWTable 204,204,122,153,153"}
+//! ```
+//!
+//! ## commands
+//!
+//! configures the bulb and restarts to connect to the esp32 access point
 //!
 //! ```bash
-//! # change color
-//! curl -X POST "http://192.168.0.102/cm?cmnd=HSBColor%20255,255,255"
-//!
-//! # set static ip
-//! curl -X POST "http://192.168.0.102/cm?cmnd=ipaddress1%20192.168.2.2"
-//! curl -X POST "http://192.168.0.102/cm?cmnd=ipaddress2%20255.255.255.0"
-//! curl -X POST "http://192.168.0.102/cm?cmnd=ipaddress3%20192.168.2.1"
-//! curl -X POST "http://192.168.0.102/cm?cmnd=restart%201"
+//! backlog template {"NAME":"Kauf Bulb", "GPIO":[0,0,0,0,416,419,0,0,417,420,418,0,0,0], "FLAG":0, "BASE":18, "CMND":"SO105 1|RGBWWTable 204,204,122,153,153"}; module 0; fade 1; devicename magic-markers-bulb; friendlyname1 magic-markers-bulb; ipaddress1 192.168.2.2; ipaddress2 192.168.2.1; ipaddress3 255.255.255.0; ssid1 magic-markers; password1 magic-markers; wificonfig 0
 //! ```
 //!
 //! # networking
 //! the rfid reader is connected to an esp32 dev kit, which starts a wifi access point
 //! it expects the bulb to be connected to its network with a static ip:
 //! - ip: 192.168.2.2
+//! - gateway: 192.168.2.1
 //! - subnet: 255.255.255.0
-//! - gateway: 192.168.2.0
 
 use alloc::format;
 use core::net::Ipv4Addr;
@@ -46,6 +49,7 @@ use core::{
 };
 use defmt::{debug, error, info, warn, Format};
 use embassy_executor::Spawner;
+use embassy_net::dns::DnsSocket;
 use embassy_net::tcp::client::{TcpClient, TcpClientState};
 use embassy_net::tcp::TcpSocket;
 use embassy_net::{IpListenEndpoint, Ipv4Cidr, Runner, Stack, StaticConfigV4};
@@ -60,13 +64,18 @@ use esp_hal::{
     Blocking,
 };
 use esp_wifi::wifi::{
-    AccessPointConfiguration, Configuration, WifiController, WifiDevice, WifiEvent, WifiState,
+    AccessPointConfiguration, AuthMethod, Configuration, WifiController, WifiDevice, WifiEvent,
+    WifiState,
 };
 use mfrc522::{comm::blocking::i2c::I2cInterface, GenericUid, Initialized, Mfrc522, Uid};
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
 use static_cell::StaticCell;
 extern crate alloc;
+
+const HTTP_SERVER: bool = false;
+const SSID: &str = "magic-markers";
+const PASSWORD: &str = "magic-markers";
 
 /// marker colors, with map to and from their rfid uid values
 /// explicitly map to/from u8 values (which is what is persisted in global state via AtomicU8)
@@ -87,6 +96,22 @@ enum MarkerColor {
     Violet = 12,
 }
 impl MarkerColor {
+    fn hsb(&self) -> (u8, u8, u8) {
+        match self {
+            MarkerColor::Red => (0, 255, 255),
+            MarkerColor::Brown => (30, 255, 255),
+            MarkerColor::BlueLagoon => (180, 255, 255),
+            MarkerColor::Green => (120, 255, 255),
+            MarkerColor::Black => (0, 0, 0),
+            MarkerColor::SandyTan => (30, 100, 200),
+            MarkerColor::Gray => (0, 0, 128),
+            MarkerColor::Pink => (0, 255, 255),
+            MarkerColor::Blue => (240, 255, 255),
+            MarkerColor::Yellow => (60, 255, 255),
+            MarkerColor::Orange => (30, 255, 200),
+            MarkerColor::Violet => (0, 255, 255),
+        }
+    }
     fn uid(&self) -> [u8; 7] {
         match self {
             MarkerColor::Red => [4, 61, 60, 18, 54, 30, 145],
@@ -270,10 +295,20 @@ async fn main(spawner: Spawner) {
     spawner.spawn(button_task(button)).unwrap();
     spawner.spawn(connection_task(ctrl)).unwrap();
     spawner.spawn(net_task(runner)).unwrap();
-    spawner.spawn(web_task(stack, bulb_ip_addr_str)).unwrap();
-    // spawner
-    //     .spawn(http_server_task(stack, gw_ip_addr_str))
-    //     .unwrap();
+
+    // http server is a simple landing page
+    // to test wifi ap setup
+    if HTTP_SERVER {
+        spawner
+            .spawn(http_server_task(stack, gw_ip_addr_str))
+            .unwrap();
+    }
+    // normal operations - post to tasmota bulb
+    else {
+        spawner
+            .spawn(tasmota_commands_task(stack, bulb_ip_addr_str))
+            .unwrap();
+    }
 }
 
 // tasks
@@ -357,7 +392,9 @@ async fn connection_task(mut controller: WifiController<'static>) {
         }
         if !matches!(controller.is_started(), Ok(true)) {
             let client_config = Configuration::AccessPoint(AccessPointConfiguration {
-                ssid: "magic-markers".try_into().unwrap(),
+                ssid: SSID.try_into().unwrap(),
+                password: PASSWORD.try_into().unwrap(),
+                auth_method: AuthMethod::WPA2Personal,
                 ..Default::default()
             });
             controller.set_configuration(&client_config).unwrap();
@@ -380,8 +417,8 @@ async fn http_server_task(stack: Stack<'static>, gw_ip_addr: &'static str) {
         Timer::after(Duration::from_millis(500)).await;
     }
     info!(
-        "connect to `magic-markers` and point your browser to http://{}:8080/",
-        gw_ip_addr
+        "connect to `{}` and point your browser to http://{}:8080/",
+        SSID, gw_ip_addr
     );
     while !stack.is_config_up() {
         Timer::after(Duration::from_millis(100)).await
@@ -453,8 +490,9 @@ async fn http_server_task(stack: Stack<'static>, gw_ip_addr: &'static str) {
     }
 }
 
+// manages communication with the tasmota bulb
 #[embassy_executor::task]
-pub async fn web_task(stack: Stack<'static>, bulb_ip_addr_str: &'static str) {
+pub async fn tasmota_commands_task(stack: Stack<'static>, bulb_ip_addr_str: &'static str) {
     info!("starting web task...");
     while !stack.is_config_up() {
         Timer::after_millis(100).await;
@@ -463,47 +501,78 @@ pub async fn web_task(stack: Stack<'static>, bulb_ip_addr_str: &'static str) {
         Timer::after_millis(500).await;
     }
     stack.wait_config_up().await;
-    let state = TcpClientState::<1, 4096, 4096>::new();
-    let mut tcp_client = TcpClient::new(stack, &state);
+    static TCP_CLIENT_INIT: StaticCell<TcpClient<'static, 1, 4096, 4096>> = StaticCell::new();
+    static STATE_INIT: StaticCell<TcpClientState<1, 4096, 4096>> = StaticCell::new();
+    static DNS_CLIENT_INIT: StaticCell<embassy_net::dns::DnsSocket<'static>> = StaticCell::new();
+    static HTTP_CLIENT_INIT: StaticCell<
+        HttpClient<
+            'static,
+            TcpClient<'static, 1, 4096, 4096>,
+            embassy_net::dns::DnsSocket<'static>,
+        >,
+    > = StaticCell::new();
+    let state = STATE_INIT.init(TcpClientState::<1, 4096, 4096>::new());
+    let tcp_client = TCP_CLIENT_INIT.init(TcpClient::new(stack, state));
     tcp_client.set_timeout(Some(Duration::from_secs(5)));
-    let dns_client = embassy_net::dns::DnsSocket::new(stack);
-    let mut client = HttpClient::new(&tcp_client, &dns_client);
+    let dns_client = DNS_CLIENT_INIT.init(DnsSocket::new(stack));
+    let client = HTTP_CLIENT_INIT.init(HttpClient::new(tcp_client, dns_client));
     let mut buffer = [0u8; 4096];
-    let method = Method::POST;
-    let url = format!("http://{}/cm?cmnd=Power%20TOGGLE", bulb_ip_addr_str);
     loop {
-        info!("sending request: {} {}", method, url.as_str());
-        let mut req = match client.request(method, url.as_str()).await {
-            Ok(req) => req,
-            Err(e) => {
-                info!("request build error: {:?}", e);
-                Timer::after(Duration::from_secs(2)).await;
-                continue;
-            }
+        send_tasmota_command(client, &mut buffer, bulb_ip_addr_str, "power%20on").await;
+        Timer::after(Duration::from_millis(500)).await;
+        let current_color_u8 = LAST_MARKER_COLOR.load(Ordering::Relaxed);
+        let Ok(current_color): Result<MarkerColor, _> = current_color_u8.try_into() else {
+            continue;
         };
-        let res = match req.send(&mut buffer).await {
-            Ok(res) => res,
-            Err(e) => {
-                info!("request send error: {:?}", e);
-                return;
-            }
-        };
-        info!("request sent successfully");
-        match res.body().read_to_end().await {
-            Ok(read) => {
-                info!("response body read successfully, length: {}", read.len());
-                match core::str::from_utf8(read) {
-                    Ok(body) => info!("response body: {:?}", body),
-                    Err(_) => info!("response body is not valid UTF-8"),
-                }
-            }
-            Err(e) => info!("failed to read response body: {:?}", e),
-        }
-        Timer::after(Duration::from_secs(2)).await;
+        let hsb = current_color.hsb();
+        let command = format!("hsbcolor%20{},{},{}", hsb.0, hsb.1, hsb.2);
+        send_tasmota_command(client, &mut buffer, bulb_ip_addr_str, command.as_str()).await;
+        Timer::after(Duration::from_millis(500)).await;
     }
 }
 
 // helpers
+
+async fn send_tasmota_command(
+    client: &mut HttpClient<
+        'static,
+        TcpClient<'static, 1, 4096, 4096>,
+        embassy_net::dns::DnsSocket<'static>,
+    >,
+    buffer: &mut [u8; 4096],
+    bulb_ip_addr: &str,
+    command: &str,
+) {
+    let url = format!("http://{}/cm?cmnd={}", bulb_ip_addr, command);
+    let method = Method::POST;
+    info!("sending request: {} {}", method, url.as_str());
+    let mut req = match client.request(method, url.as_str()).await {
+        Ok(req) => req,
+        Err(e) => {
+            warn!("request build error: {:?}", e);
+            Timer::after(Duration::from_secs(2)).await;
+            return;
+        }
+    };
+    let res = match req.send(buffer).await {
+        Ok(res) => res,
+        Err(e) => {
+            warn!("request send error: {:?}", e);
+            return;
+        }
+    };
+    info!("request sent successfully");
+    match res.body().read_to_end().await {
+        Ok(read) => {
+            info!("response body read successfully, length: {}", read.len());
+            match core::str::from_utf8(read) {
+                Ok(body) => info!("response body: {:?}", body),
+                Err(_) => warn!("response body is not valid UTF-8"),
+            }
+        }
+        Err(e) => warn!("failed to read response body: {}", e),
+    }
+}
 
 /// when we detect a marker from our set of markers, update global state
 /// if it's the same marker as the current one, do nothing
