@@ -42,6 +42,7 @@
 //! - subnet: 255.255.255.0
 
 use alloc::format;
+use core::fmt;
 use core::net::Ipv4Addr;
 use core::{
     str::FromStr,
@@ -49,12 +50,15 @@ use core::{
 };
 use defmt::{debug, error, info, warn, Format};
 use embassy_executor::Spawner;
-use embassy_net::dns::DnsSocket;
-use embassy_net::tcp::client::{TcpClient, TcpClientState};
-use embassy_net::tcp::TcpSocket;
-use embassy_net::{IpListenEndpoint, Ipv4Cidr, Runner, Stack, StaticConfigV4};
+use embassy_net::{
+    dns::DnsSocket,
+    tcp::client::{TcpClient, TcpClientState},
+    Ipv4Cidr, Runner, Stack, StaticConfigV4,
+};
+use embassy_sync::blocking_mutex::raw::NoopRawMutex;
+// use embassy_sync::blocking_mutex::Mutex;
+use embassy_sync::channel::Channel;
 use embassy_time::{Duration, Instant, Timer};
-use embedded_io_async::Write;
 use esp_hal::{
     clock::CpuClock,
     gpio::{Input, InputConfig, Level, Output, OutputConfig, Pull},
@@ -73,7 +77,6 @@ use reqwless::request::Method;
 use static_cell::StaticCell;
 extern crate alloc;
 
-const HTTP_SERVER: bool = false;
 const SSID: &str = "magic-markers";
 const PASSWORD: &str = "magic-markers";
 
@@ -192,6 +195,42 @@ fn panic(_: &core::panic::PanicInfo) -> ! {
     loop {}
 }
 
+#[derive(Format, Clone)]
+enum TasmotaCommand {
+    HSBColor(u8, u8, u8),
+    White(u16),
+}
+impl fmt::Display for TasmotaCommand {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
+        match self {
+            TasmotaCommand::HSBColor(h, s, b) => {
+                write!(f, "hsbcolor%20{},{},{}", h, s, b)
+            }
+            TasmotaCommand::White(value) => write!(f, "white%20{}", value),
+        }
+    }
+}
+
+/// context/state
+///
+/// on mutex type: https://github.com/embassy-rs/embassy/issues/4034#issuecomment-2774951121
+struct Context {
+    // channels
+    bulb_channel: Channel<NoopRawMutex, TasmotaCommand, 8>,
+    // state
+    // current_marker: Mutex<NoopRawMutex, Option<MarkerColor>>,
+    // last_marker_detected: AtomicU32,
+}
+impl Context {
+    fn new() -> Self {
+        Context {
+            bulb_channel: Channel::new(),
+            // current_marker: Mutex::new(None),
+            // last_marker_detected: AtomicU32::new(0),
+        }
+    }
+}
+
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
     // real time transfer - for debug/logging
@@ -202,6 +241,8 @@ async fn main(spawner: Spawner) {
     let timer0 = SystemTimer::new(peripherals.SYSTIMER);
     esp_hal_embassy::init(timer0.alarm0);
     info!("embassy initialized");
+    static CONTEXT_INIT: StaticCell<Context> = StaticCell::new();
+    let context = CONTEXT_INIT.init(Context::new());
 
     // initialize wifi
     static WIFI_INIT: StaticCell<esp_wifi::EspWifiController> = StaticCell::new();
@@ -229,8 +270,7 @@ async fn main(spawner: Spawner) {
     info!("wifi controller initialized");
 
     // initialize led
-    let mut led: Output<'_> = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
-    led.set_low();
+    let led: Output<'_> = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
 
     // initialize button
     let button = Input::new(
@@ -290,37 +330,29 @@ async fn main(spawner: Spawner) {
     }
 
     // start up tasks
-    spawner.spawn(rfid_task(mfrc522)).unwrap();
+    spawner.spawn(rfid_task(mfrc522, context)).unwrap();
     spawner.spawn(led_task(led)).unwrap();
-    spawner.spawn(button_task(button)).unwrap();
+    spawner.spawn(button_task(button, context)).unwrap();
     spawner.spawn(connection_task(ctrl)).unwrap();
     spawner.spawn(net_task(runner)).unwrap();
-
-    // http server is a simple landing page
-    // to test wifi ap setup
-    if HTTP_SERVER {
-        spawner
-            .spawn(http_server_task(stack, gw_ip_addr_str))
-            .unwrap();
-    }
-    // normal operations - post to tasmota bulb
-    else {
-        spawner
-            .spawn(tasmota_commands_task(stack, bulb_ip_addr_str))
-            .unwrap();
-    }
+    spawner
+        .spawn(bulb_commands_task(stack, bulb_ip_addr_str, context))
+        .unwrap();
 }
 
 // tasks
 
 /// task for button press
 #[embassy_executor::task]
-async fn button_task(button: Input<'static>) {
+async fn button_task(button: Input<'static>, context: &'static Context) {
     let mut was_pressed = false;
     loop {
         let is_pressed = button.is_low();
         if is_pressed && !was_pressed {
-            reset_marker_color();
+            LAST_MARKER_COLOR.store(0, Ordering::Relaxed);
+            LAST_MARKER_COLOR_UPDATED_AT
+                .store(Instant::now().as_millis() as u32, Ordering::Relaxed);
+            context.bulb_channel.send(TasmotaCommand::White(100)).await;
         }
         was_pressed = is_pressed;
         Timer::after(Duration::from_millis(100)).await;
@@ -330,6 +362,7 @@ async fn button_task(button: Input<'static>) {
 /// loop for managing led
 #[embassy_executor::task]
 async fn led_task(mut led: Output<'static>) {
+    led.set_low();
     loop {
         let now = Instant::now().as_millis() as u32;
         let last_uid_at = LAST_MARKER_COLOR_UPDATED_AT.load(Ordering::Relaxed);
@@ -344,14 +377,24 @@ async fn led_task(mut led: Output<'static>) {
 
 /// loop for rfid reader
 #[embassy_executor::task]
-async fn rfid_task(mut mfrc522: Mfrc522<I2cInterface<I2c<'static, Blocking>>, Initialized>) {
+async fn rfid_task(
+    mut mfrc522: Mfrc522<I2cInterface<I2c<'static, Blocking>>, Initialized>,
+    context: &'static Context,
+) {
     loop {
         if let Ok(atqa) = mfrc522.new_card_present() {
             match mfrc522.select(&atqa) {
                 Ok(Uid::Double(inner)) => {
                     if let Some(marker_color) = MarkerColor::from_uid(&inner) {
                         info!("detected color: {}", marker_color);
-                        marker_detected(marker_color);
+                        LAST_MARKER_COLOR.store(marker_color.clone() as u8, Ordering::Relaxed);
+                        LAST_MARKER_COLOR_UPDATED_AT
+                            .store(Instant::now().as_millis() as u32, Ordering::Relaxed);
+                        let (h, s, b) = marker_color.hsb();
+                        context
+                            .bulb_channel
+                            .send(TasmotaCommand::HSBColor(h, s, b))
+                            .await;
                     } else {
                         info!("unknown marker uid: {}", inner.as_bytes());
                     }
@@ -408,101 +451,15 @@ async fn connection_task(mut controller: WifiController<'static>) {
     }
 }
 
-/// serves a simple landing page
-#[embassy_executor::task]
-async fn http_server_task(stack: Stack<'static>, gw_ip_addr: &'static str) {
-    let mut rx_buffer = [0; 1536];
-    let mut tx_buffer = [0; 1536];
-    loop {
-        if stack.is_link_up() {
-            break;
-        }
-        Timer::after(Duration::from_millis(500)).await;
-    }
-    info!(
-        "connect to `{}` and point your browser to http://{}:8080/",
-        SSID, gw_ip_addr
-    );
-    while !stack.is_config_up() {
-        Timer::after(Duration::from_millis(100)).await
-    }
-    stack
-        .config_v4()
-        .inspect(|c| info!("ipv4 config: {}", c.address));
-    let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-    socket.set_timeout(Some(embassy_time::Duration::from_secs(10)));
-    loop {
-        info!("wait for connection...");
-        let r = socket
-            .accept(IpListenEndpoint {
-                addr: None,
-                port: 8080,
-            })
-            .await;
-        info!("connected...");
-        if let Err(e) = r {
-            warn!("connect error: {}", e);
-            continue;
-        }
-        let mut buffer = [0u8; 1024];
-        let mut pos = 0;
-        loop {
-            match socket.read(&mut buffer).await {
-                Ok(0) => {
-                    info!("read EOF");
-                    break;
-                }
-                Ok(len) => {
-                    let to_print =
-                        unsafe { core::str::from_utf8_unchecked(&buffer[..(pos + len)]) };
-                    if to_print.contains("\r\n\r\n") {
-                        info!("{}", to_print);
-                        break;
-                    }
-                    pos += len;
-                }
-                Err(e) => {
-                    warn!("read error: {}", e);
-                    break;
-                }
-            };
-        }
-        let r = socket
-            .write_all(
-                b"HTTP/1.0 200 OK\r\n\r\n\
-            <html>\
-                <body>\
-                    <h1>magic-markers</h1>\
-                    <p>connect a tasmota bulb to the `magic-markers` wifi network</p>\
-                </body>\
-            </html>\r\n\
-            ",
-            )
-            .await;
-        if let Err(e) = r {
-            warn!("write error: {}", e);
-        }
-        let r = socket.flush().await;
-        if let Err(e) = r {
-            info!("flush error: {:?}", e);
-        }
-        Timer::after(Duration::from_millis(1000)).await;
-        socket.close();
-        Timer::after(Duration::from_millis(1000)).await;
-        socket.abort();
-    }
-}
-
 // manages communication with the tasmota bulb
 #[embassy_executor::task]
-pub async fn tasmota_commands_task(stack: Stack<'static>, bulb_ip_addr_str: &'static str) {
+pub async fn bulb_commands_task(
+    stack: Stack<'static>,
+    bulb_ip_addr_str: &'static str,
+    context: &'static Context,
+) {
     info!("starting web task...");
-    while !stack.is_config_up() {
-        Timer::after_millis(100).await;
-    }
-    while !stack.is_link_up() {
-        Timer::after_millis(500).await;
-    }
+    stack.wait_link_up().await;
     stack.wait_config_up().await;
     static TCP_CLIENT_INIT: StaticCell<TcpClient<'static, 1, 4096, 4096>> = StaticCell::new();
     static STATE_INIT: StaticCell<TcpClientState<1, 4096, 4096>> = StaticCell::new();
@@ -521,25 +478,15 @@ pub async fn tasmota_commands_task(stack: Stack<'static>, bulb_ip_addr_str: &'st
     let client = HTTP_CLIENT_INIT.init(HttpClient::new(tcp_client, dns_client));
     let mut buffer = [0u8; 4096];
     loop {
-        // send_tasmota_command(client, &mut buffer, bulb_ip_addr_str, "power%20on").await;
-        let current_color_u8 = LAST_MARKER_COLOR.load(Ordering::Relaxed);
-        info!("current color u8: {}", current_color_u8);
-        let Ok(current_color): Result<MarkerColor, _> = current_color_u8.try_into() else {
-            send_tasmota_command(client, &mut buffer, bulb_ip_addr_str, "hsbcolor%200,0,0").await;
-            Timer::after(Duration::from_millis(500)).await;
-            continue;
-        };
-        let hsb = current_color.hsb();
-        let command = format!("hsbcolor%20{},{},{}", hsb.0, hsb.1, hsb.2);
-        send_tasmota_command(client, &mut buffer, bulb_ip_addr_str, command.as_str()).await;
-        Timer::after(Duration::from_millis(500)).await;
+        let command = context.bulb_channel.receive().await;
+        send_bulb_command(client, &mut buffer, bulb_ip_addr_str, command).await;
     }
 }
 
 // helpers
 
 /// send a command to the tasmota bulb
-async fn send_tasmota_command(
+async fn send_bulb_command(
     client: &mut HttpClient<
         'static,
         TcpClient<'static, 1, 4096, 4096>,
@@ -547,7 +494,7 @@ async fn send_tasmota_command(
     >,
     buffer: &mut [u8; 4096],
     bulb_ip_addr: &str,
-    command: &str,
+    command: TasmotaCommand,
 ) {
     let url = format!("http://{}/cm?cmnd={}", bulb_ip_addr, command);
     let method = Method::POST;
@@ -578,20 +525,7 @@ async fn send_tasmota_command(
         }
         Err(e) => warn!("failed to read response body: {}", e),
     }
-}
-
-/// when we detect a marker from our set of markers, update global state
-/// if it's the same marker as the current one, do nothing
-/// otherwise set updated at and set the current marker to the new one
-fn marker_detected(color: MarkerColor) {
-    LAST_MARKER_COLOR.store(color.clone() as u8, Ordering::Relaxed);
-    LAST_MARKER_COLOR_UPDATED_AT.store(Instant::now().as_millis() as u32, Ordering::Relaxed);
-    info!("color update: {:?}", color);
-}
-
-/// clears the last marker color and resets the updated at timestamp
-fn reset_marker_color() {
-    LAST_MARKER_COLOR.store(0, Ordering::Relaxed);
-    LAST_MARKER_COLOR_UPDATED_AT.store(Instant::now().as_millis() as u32, Ordering::Relaxed);
-    info!("marker color reset");
+    // commands return quickly but process in the background (ie fade)
+    // artificially wait to allow the command to be processed
+    Timer::after(Duration::from_millis(500)).await;
 }
