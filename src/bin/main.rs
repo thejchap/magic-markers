@@ -56,8 +56,7 @@ use embassy_net::{
     Ipv4Cidr, Runner, Stack, StaticConfigV4,
 };
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
-// use embassy_sync::blocking_mutex::Mutex;
-use embassy_sync::channel::Channel;
+use embassy_sync::channel::{Channel, Receiver, Sender};
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::{
     clock::CpuClock,
@@ -74,8 +73,16 @@ use esp_wifi::wifi::{
 use mfrc522::{comm::blocking::i2c::I2cInterface, GenericUid, Initialized, Mfrc522, Uid};
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
-use static_cell::StaticCell;
 extern crate alloc;
+
+macro_rules! mk_static {
+    ($t:ty,$val:expr) => {{
+        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
+        #[deny(unused_attributes)]
+        let x = STATIC_CELL.uninit().write(($val));
+        x
+    }};
+}
 
 const SSID: &str = "magic-markers";
 const PASSWORD: &str = "magic-markers";
@@ -211,25 +218,27 @@ impl fmt::Display for TasmotaCommand {
     }
 }
 
-/// context/state
-///
-/// on mutex type: https://github.com/embassy-rs/embassy/issues/4034#issuecomment-2774951121
-struct Context {
-    // channels
-    bulb_channel: Channel<NoopRawMutex, TasmotaCommand, 8>,
-    // state
-    // current_marker: Mutex<NoopRawMutex, Option<MarkerColor>>,
-    // last_marker_detected: AtomicU32,
-}
-impl Context {
-    fn new() -> Self {
-        Context {
-            bulb_channel: Channel::new(),
-            // current_marker: Mutex::new(None),
-            // last_marker_detected: AtomicU32::new(0),
-        }
-    }
-}
+type BulbChannel = Channel<NoopRawMutex, TasmotaCommand, 8>;
+type BulbChannelSender = Sender<'static, NoopRawMutex, TasmotaCommand, 8>;
+type BulbChannelReceiver = Receiver<'static, NoopRawMutex, TasmotaCommand, 8>;
+
+// /// context/state
+// ///
+// /// on mutex type: https://github.com/embassy-rs/embassy/issues/4034#issuecomment-2774951121
+// struct State {
+//     // channels
+//     // state
+//     // current_marker: Mutex<NoopRawMutex, Option<MarkerColor>>,
+//     // last_marker_detected: AtomicU32,
+// }
+// impl State {
+//     fn new() -> Self {
+//         State {
+//             // current_marker: Mutex::new(None),
+//             // last_marker_detected: AtomicU32::new(0),
+//         }
+//     }
+// }
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
@@ -241,16 +250,16 @@ async fn main(spawner: Spawner) {
     let timer0 = SystemTimer::new(peripherals.SYSTIMER);
     esp_hal_embassy::init(timer0.alarm0);
     info!("embassy initialized");
-    static CONTEXT_INIT: StaticCell<Context> = StaticCell::new();
-    let context = CONTEXT_INIT.init(Context::new());
+    let bulb_channel = mk_static!(BulbChannel, BulbChannel::new());
 
     // initialize wifi
-    static WIFI_INIT: StaticCell<esp_wifi::EspWifiController> = StaticCell::new();
-    static RESOURCES: StaticCell<embassy_net::StackResources<3>> = StaticCell::new();
     let timer1 = TimerGroup::new(peripherals.TIMG0);
     let mut rng = esp_hal::rng::Rng::new(peripherals.RNG);
     let seed = rng.random().into();
-    let init = WIFI_INIT.init(esp_wifi::init(timer1.timer0, rng, peripherals.RADIO_CLK).unwrap());
+    let init = mk_static!(
+        esp_wifi::EspWifiController,
+        esp_wifi::init(timer1.timer0, rng, peripherals.RADIO_CLK).unwrap()
+    );
     let (ctrl, interfaces) = esp_wifi::wifi::new(init, peripherals.WIFI).unwrap();
     let device = interfaces.ap;
     let gw_ip_addr_str = "192.168.2.1";
@@ -264,7 +273,10 @@ async fn main(spawner: Spawner) {
     let (stack, runner) = embassy_net::new(
         device,
         config,
-        RESOURCES.init(embassy_net::StackResources::new()),
+        mk_static!(
+            embassy_net::StackResources<3>,
+            embassy_net::StackResources::new()
+        ),
         seed,
     );
     info!("wifi controller initialized");
@@ -330,13 +342,21 @@ async fn main(spawner: Spawner) {
     }
 
     // start up tasks
-    spawner.spawn(rfid_task(mfrc522, context)).unwrap();
+    spawner
+        .spawn(rfid_task(mfrc522, bulb_channel.sender()))
+        .unwrap();
     spawner.spawn(led_task(led)).unwrap();
-    spawner.spawn(button_task(button, context)).unwrap();
+    spawner
+        .spawn(button_task(button, bulb_channel.sender()))
+        .unwrap();
     spawner.spawn(connection_task(ctrl)).unwrap();
     spawner.spawn(net_task(runner)).unwrap();
     spawner
-        .spawn(bulb_commands_task(stack, bulb_ip_addr_str, context))
+        .spawn(bulb_commands_task(
+            stack,
+            bulb_ip_addr_str,
+            bulb_channel.receiver(),
+        ))
         .unwrap();
 }
 
@@ -344,7 +364,7 @@ async fn main(spawner: Spawner) {
 
 /// task for button press
 #[embassy_executor::task]
-async fn button_task(button: Input<'static>, context: &'static Context) {
+async fn button_task(button: Input<'static>, bulb_channel_sender: BulbChannelSender) {
     let mut was_pressed = false;
     loop {
         let is_pressed = button.is_low();
@@ -352,7 +372,7 @@ async fn button_task(button: Input<'static>, context: &'static Context) {
             LAST_MARKER_COLOR.store(0, Ordering::Relaxed);
             LAST_MARKER_COLOR_UPDATED_AT
                 .store(Instant::now().as_millis() as u32, Ordering::Relaxed);
-            context.bulb_channel.send(TasmotaCommand::White(100)).await;
+            bulb_channel_sender.send(TasmotaCommand::White(100)).await;
         }
         was_pressed = is_pressed;
         Timer::after(Duration::from_millis(100)).await;
@@ -379,7 +399,7 @@ async fn led_task(mut led: Output<'static>) {
 #[embassy_executor::task]
 async fn rfid_task(
     mut mfrc522: Mfrc522<I2cInterface<I2c<'static, Blocking>>, Initialized>,
-    context: &'static Context,
+    bulb_channel_sender: BulbChannelSender,
 ) {
     loop {
         if let Ok(atqa) = mfrc522.new_card_present() {
@@ -391,8 +411,7 @@ async fn rfid_task(
                         LAST_MARKER_COLOR_UPDATED_AT
                             .store(Instant::now().as_millis() as u32, Ordering::Relaxed);
                         let (h, s, b) = marker_color.hsb();
-                        context
-                            .bulb_channel
+                        bulb_channel_sender
                             .send(TasmotaCommand::HSBColor(h, s, b))
                             .await;
                     } else {
@@ -456,29 +475,32 @@ async fn connection_task(mut controller: WifiController<'static>) {
 pub async fn bulb_commands_task(
     stack: Stack<'static>,
     bulb_ip_addr_str: &'static str,
-    context: &'static Context,
+    bulb_channel_receiver: BulbChannelReceiver,
 ) {
     info!("starting web task...");
     stack.wait_link_up().await;
     stack.wait_config_up().await;
-    static TCP_CLIENT_INIT: StaticCell<TcpClient<'static, 1, 4096, 4096>> = StaticCell::new();
-    static STATE_INIT: StaticCell<TcpClientState<1, 4096, 4096>> = StaticCell::new();
-    static DNS_CLIENT_INIT: StaticCell<embassy_net::dns::DnsSocket<'static>> = StaticCell::new();
-    static HTTP_CLIENT_INIT: StaticCell<
+    let state = mk_static!(
+        TcpClientState<1, 4096, 4096>,
+        TcpClientState::<1, 4096, 4096>::new()
+    );
+    let tcp_client = mk_static!(
+        TcpClient<'static, 1, 4096, 4096>,
+        TcpClient::new(stack, state)
+    );
+    let dns_client = mk_static!(embassy_net::dns::DnsSocket<'static>, DnsSocket::new(stack));
+    tcp_client.set_timeout(Some(Duration::from_secs(5)));
+    let client = mk_static!(
         HttpClient<
             'static,
             TcpClient<'static, 1, 4096, 4096>,
             embassy_net::dns::DnsSocket<'static>,
         >,
-    > = StaticCell::new();
-    let state = STATE_INIT.init(TcpClientState::<1, 4096, 4096>::new());
-    let tcp_client = TCP_CLIENT_INIT.init(TcpClient::new(stack, state));
-    tcp_client.set_timeout(Some(Duration::from_secs(5)));
-    let dns_client = DNS_CLIENT_INIT.init(DnsSocket::new(stack));
-    let client = HTTP_CLIENT_INIT.init(HttpClient::new(tcp_client, dns_client));
+        HttpClient::new(tcp_client, dns_client)
+    );
     let mut buffer = [0u8; 4096];
     loop {
-        let command = context.bulb_channel.receive().await;
+        let command = bulb_channel_receiver.receive().await;
         send_bulb_command(client, &mut buffer, bulb_ip_addr_str, command).await;
     }
 }
