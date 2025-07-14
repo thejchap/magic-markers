@@ -1,3 +1,5 @@
+use crate::bulb::{BulbChannelSender, TasmotaCommand};
+use crate::led::LedStateSignal;
 use crate::marker_color::MarkerColor;
 use defmt::Format;
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
@@ -42,3 +44,31 @@ pub enum StateCommand {
 }
 
 pub type StateSignal = Signal<NoopRawMutex, StateCommand>;
+
+#[embassy_executor::task]
+pub async fn state_manager_task(
+    state_signal: &'static StateSignal,
+    bulb_channel_sender: BulbChannelSender,
+    led_state_signal: &'static LedStateSignal,
+) {
+    let mut state = State::new();
+
+    loop {
+        let command = state_signal.wait().await;
+        match command {
+            StateCommand::SetMarkerColor(color) => {
+                state.update_marker_color(color.clone());
+                let (h, s, b) = color.hsb();
+                bulb_channel_sender
+                    .send(TasmotaCommand::HSBColor(h, s, b))
+                    .await;
+                led_state_signal.signal(state.clone());
+            }
+            StateCommand::ClearMarkerColor => {
+                state.clear_marker_color();
+                bulb_channel_sender.send(TasmotaCommand::White(100)).await;
+                led_state_signal.signal(state.clone());
+            }
+        }
+    }
+}
