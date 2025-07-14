@@ -1,4 +1,5 @@
 use crate::constants::{GATEWAY_IP_ADDRESS, I2C_FREQUENCY_KHZ, RFID_I2C_ADDRESS};
+use crate::mk_static;
 use core::net::Ipv4Addr;
 use core::str::FromStr;
 use defmt::{error, info};
@@ -12,15 +13,6 @@ use esp_hal::{
 };
 use esp_wifi::wifi::{WifiController, WifiDevice};
 use mfrc522::{comm::blocking::i2c::I2cInterface, Initialized, Mfrc522};
-
-macro_rules! mk_static {
-    ($t:ty,$val:expr) => {{
-        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-        #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
-        x
-    }};
-}
 
 pub struct Peripherals {
     pub led: Output<'static>,

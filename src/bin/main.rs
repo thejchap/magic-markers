@@ -47,19 +47,11 @@ use esp_hal::clock::CpuClock;
 use magic_markers::bulb::{bulb_commands_task, BulbChannel};
 use magic_markers::constants::{BULB_IP_ADDRESS, HEAP_SIZE};
 use magic_markers::led::{led_task, LedStateSignal};
+use magic_markers::mk_static;
 use magic_markers::networking::{connection_task, net_task};
 use magic_markers::peripherals::Peripherals;
 use magic_markers::state::StateSignal;
 use magic_markers::tasks::{button_task, rfid_task, state_manager_task};
-
-macro_rules! mk_static {
-    ($t:ty,$val:expr) => {{
-        static STATIC_CELL: static_cell::StaticCell<$t> = static_cell::StaticCell::new();
-        #[deny(unused_attributes)]
-        let x = STATIC_CELL.uninit().write(($val));
-        x
-    }};
-}
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {

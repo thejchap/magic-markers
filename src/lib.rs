@@ -3,6 +3,7 @@
 pub mod bulb;
 pub mod constants;
 pub mod led;
+pub mod macros;
 pub mod marker_color;
 pub mod networking;
 pub mod peripherals;
