@@ -44,10 +44,7 @@
 use alloc::format;
 use core::fmt;
 use core::net::Ipv4Addr;
-use core::{
-    str::FromStr,
-    sync::atomic::{AtomicU32, AtomicU8, Ordering},
-};
+use core::str::FromStr;
 use defmt::{debug, error, info, warn, Format};
 use embassy_executor::Spawner;
 use embassy_net::{
@@ -57,6 +54,7 @@ use embassy_net::{
 };
 use embassy_sync::blocking_mutex::raw::NoopRawMutex;
 use embassy_sync::channel::{Channel, Receiver, Sender};
+use embassy_sync::signal::Signal;
 use embassy_time::{Duration, Instant, Timer};
 use esp_hal::{
     clock::CpuClock,
@@ -90,7 +88,7 @@ const PASSWORD: &str = "magic-markers";
 /// marker colors, with map to and from their rfid uid values
 /// explicitly map to/from u8 values (which is what is persisted in global state via AtomicU8)
 #[repr(u8)]
-#[derive(Format, PartialEq, Clone)]
+#[derive(Debug, Format, PartialEq, Clone)]
 enum MarkerColor {
     Red = 1,
     Brown = 2,
@@ -190,12 +188,38 @@ impl TryFrom<u8> for MarkerColor {
     }
 }
 
-// global state
+// state management
 
-/// last time marker color was updated - used for led flash
-static LAST_MARKER_COLOR_UPDATED_AT: AtomicU32 = AtomicU32::new(Instant::MIN.as_millis() as u32);
-/// last detected marker color
-static LAST_MARKER_COLOR: AtomicU8 = AtomicU8::new(0);
+#[derive(Debug, Clone)]
+struct State {
+    last_marker_color_updated_at: u32,
+    last_marker_color: Option<MarkerColor>,
+}
+
+impl State {
+    fn new() -> Self {
+        Self {
+            last_marker_color_updated_at: Instant::MIN.as_millis() as u32,
+            last_marker_color: None,
+        }
+    }
+    
+    fn update_marker_color(&mut self, color: MarkerColor) {
+        self.last_marker_color = Some(color);
+        self.last_marker_color_updated_at = Instant::now().as_millis() as u32;
+    }
+    
+    fn clear_marker_color(&mut self) {
+        self.last_marker_color = None;
+        self.last_marker_color_updated_at = Instant::now().as_millis() as u32;
+    }
+}
+
+#[derive(Format, Clone)]
+enum StateCommand {
+    SetMarkerColor(MarkerColor),
+    ClearMarkerColor,
+}
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -222,138 +246,153 @@ type BulbChannel = Channel<NoopRawMutex, TasmotaCommand, 8>;
 type BulbChannelSender = Sender<'static, NoopRawMutex, TasmotaCommand, 8>;
 type BulbChannelReceiver = Receiver<'static, NoopRawMutex, TasmotaCommand, 8>;
 
-// /// context/state
-// ///
-// /// on mutex type: https://github.com/embassy-rs/embassy/issues/4034#issuecomment-2774951121
-// struct State {
-//     // channels
-//     // state
-//     // current_marker: Mutex<NoopRawMutex, Option<MarkerColor>>,
-//     // last_marker_detected: AtomicU32,
-// }
-// impl State {
-//     fn new() -> Self {
-//         State {
-//             // current_marker: Mutex::new(None),
-//             // last_marker_detected: AtomicU32::new(0),
-//         }
-//     }
-// }
+type StateSignal = Signal<NoopRawMutex, StateCommand>;
+type LedStateSignal = Signal<NoopRawMutex, State>;
+
+struct Peripherals {
+    led: Output<'static>,
+    button: Input<'static>,
+    mfrc522: Mfrc522<I2cInterface<I2c<'static, Blocking>>, Initialized>,
+    wifi_controller: WifiController<'static>,
+    network_runner: Runner<'static, WifiDevice<'static>>,
+    network_stack: Stack<'static>,
+}
+
+impl Peripherals {
+    fn new(esp_peripherals: esp_hal::peripherals::Peripherals) -> Self {
+        let timer0 = SystemTimer::new(esp_peripherals.SYSTIMER);
+        esp_hal_embassy::init(timer0.alarm0);
+        info!("embassy initialized");
+
+        let timer1 = TimerGroup::new(esp_peripherals.TIMG0);
+        let mut rng = esp_hal::rng::Rng::new(esp_peripherals.RNG);
+        let seed = rng.random().into();
+        let init = mk_static!(
+            esp_wifi::EspWifiController,
+            esp_wifi::init(timer1.timer0, rng, esp_peripherals.RADIO_CLK).unwrap()
+        );
+        let (ctrl, interfaces) = esp_wifi::wifi::new(init, esp_peripherals.WIFI).unwrap();
+        let device = interfaces.ap;
+        let gw_ip_addr_str = "192.168.2.1";
+        let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).expect("failed to parse gateway ip");
+        let config = embassy_net::Config::ipv4_static(StaticConfigV4 {
+            address: Ipv4Cidr::new(gw_ip_addr, 24),
+            gateway: Some(gw_ip_addr),
+            dns_servers: Default::default(),
+        });
+        let (stack, runner) = embassy_net::new(
+            device,
+            config,
+            mk_static!(
+                embassy_net::StackResources<3>,
+                embassy_net::StackResources::new()
+            ),
+            seed,
+        );
+        info!("wifi controller initialized");
+
+        let led: Output<'_> =
+            Output::new(esp_peripherals.GPIO7, Level::Low, OutputConfig::default());
+
+        let button = Input::new(
+            esp_peripherals.GPIO9,
+            InputConfig::default().with_pull(Pull::Up),
+        );
+
+        let sda = esp_peripherals.GPIO2;
+        let scl = esp_peripherals.GPIO1;
+
+        let mut i2c = match I2c::new(
+            esp_peripherals.I2C0,
+            Config::default().with_frequency(Rate::from_khz(100)),
+        ) {
+            Ok(i2c) => {
+                info!("i2c initialized");
+                i2c
+            }
+            Err(e) => {
+                error!("i2c init error: {:?}", e);
+                panic!();
+            }
+        };
+
+        i2c = i2c.with_sda(sda).with_scl(scl);
+
+        let itf = I2cInterface::new(i2c, 0x28);
+        let mut mfrc522 = Mfrc522::new(itf).init().unwrap_or_else(|e| match e {
+            mfrc522::Error::Comm(c) => {
+                error!("mfrc522 comm error: {:?}", c);
+                panic!();
+            }
+            _ => {
+                error!("other mfrc522 init error");
+                panic!();
+            }
+        });
+        if let Ok(version) = mfrc522.version() {
+            info!("mfrc522 version: {:?}", version);
+        } else {
+            error!("mfrc522 version error");
+            panic!();
+        }
+
+        match mfrc522.set_antenna_gain(mfrc522::RxGain::DB48) {
+            Ok(()) => info!("antenna gain set"),
+            Err(_) => {
+                error!("failed to set antenna gain");
+                panic!();
+            }
+        }
+
+        Self {
+            led,
+            button,
+            mfrc522,
+            wifi_controller: ctrl,
+            network_runner: runner,
+            network_stack: stack,
+        }
+    }
+}
 
 #[esp_hal_embassy::main]
 async fn main(spawner: Spawner) {
     // real time transfer - for debug/logging
     rtt_target::rtt_init_defmt!();
     let config = esp_hal::Config::default().with_cpu_clock(CpuClock::max());
-    let peripherals = esp_hal::init(config);
+    let esp_peripherals = esp_hal::init(config);
     esp_alloc::heap_allocator!(size: 72 * 1024);
-    let timer0 = SystemTimer::new(peripherals.SYSTIMER);
-    esp_hal_embassy::init(timer0.alarm0);
-    info!("embassy initialized");
+
+    let peripherals = Peripherals::new(esp_peripherals);
     let bulb_channel = mk_static!(BulbChannel, BulbChannel::new());
-
-    // initialize wifi
-    let timer1 = TimerGroup::new(peripherals.TIMG0);
-    let mut rng = esp_hal::rng::Rng::new(peripherals.RNG);
-    let seed = rng.random().into();
-    let init = mk_static!(
-        esp_wifi::EspWifiController,
-        esp_wifi::init(timer1.timer0, rng, peripherals.RADIO_CLK).unwrap()
-    );
-    let (ctrl, interfaces) = esp_wifi::wifi::new(init, peripherals.WIFI).unwrap();
-    let device = interfaces.ap;
-    let gw_ip_addr_str = "192.168.2.1";
+    let state_signal = mk_static!(StateSignal, StateSignal::new());
+    let led_state_signal = mk_static!(LedStateSignal, LedStateSignal::new());
     let bulb_ip_addr_str = "192.168.2.2";
-    let gw_ip_addr = Ipv4Addr::from_str(gw_ip_addr_str).expect("failed to parse gateway ip");
-    let config = embassy_net::Config::ipv4_static(StaticConfigV4 {
-        address: Ipv4Cidr::new(gw_ip_addr, 24),
-        gateway: Some(gw_ip_addr),
-        dns_servers: Default::default(),
-    });
-    let (stack, runner) = embassy_net::new(
-        device,
-        config,
-        mk_static!(
-            embassy_net::StackResources<3>,
-            embassy_net::StackResources::new()
-        ),
-        seed,
-    );
-    info!("wifi controller initialized");
-
-    // initialize led
-    let led: Output<'_> = Output::new(peripherals.GPIO7, Level::Low, OutputConfig::default());
-
-    // initialize button
-    let button = Input::new(
-        peripherals.GPIO9,
-        InputConfig::default().with_pull(Pull::Up),
-    );
-
-    // rfid reader
-    let sda = peripherals.GPIO2;
-    let scl = peripherals.GPIO1;
-
-    // communicates via i2c protocol
-    let mut i2c = match I2c::new(
-        peripherals.I2C0,
-        // 100khz is i2c standard
-        Config::default().with_frequency(Rate::from_khz(100)),
-    ) {
-        Ok(i2c) => {
-            info!("i2c initialized");
-            i2c
-        }
-        Err(e) => {
-            error!("i2c init error: {:?}", e);
-            panic!();
-        }
-    };
-
-    // set serial data and clock pins for i2c
-    i2c = i2c.with_sda(sda).with_scl(scl);
-
-    // i2c interface and rfid driver - 0x28 address found on rfid2 product page
-    let itf = I2cInterface::new(i2c, 0x28);
-    let mut mfrc522 = Mfrc522::new(itf).init().unwrap_or_else(|e| match e {
-        mfrc522::Error::Comm(c) => {
-            error!("mfrc522 comm error: {:?}", c);
-            panic!();
-        }
-        _ => {
-            error!("other mfrc522 init error");
-            panic!();
-        }
-    });
-    if let Ok(version) = mfrc522.version() {
-        info!("mfrc522 version: {:?}", version);
-    } else {
-        error!("mfrc522 version error");
-        panic!();
-    }
-
-    // max out antenna gain
-    match mfrc522.set_antenna_gain(mfrc522::RxGain::DB48) {
-        Ok(()) => info!("antenna gain set"),
-        Err(_) => {
-            error!("failed to set antenna gain");
-            panic!();
-        }
-    }
 
     // start up tasks
     spawner
-        .spawn(rfid_task(mfrc522, bulb_channel.sender()))
+        .spawn(state_manager_task(
+            state_signal,
+            bulb_channel.sender(),
+            led_state_signal,
+        ))
         .unwrap();
-    spawner.spawn(led_task(led)).unwrap();
     spawner
-        .spawn(button_task(button, bulb_channel.sender()))
+        .spawn(rfid_task(peripherals.mfrc522, state_signal))
         .unwrap();
-    spawner.spawn(connection_task(ctrl)).unwrap();
-    spawner.spawn(net_task(runner)).unwrap();
+    spawner
+        .spawn(led_task(peripherals.led, led_state_signal))
+        .unwrap();
+    spawner
+        .spawn(button_task(peripherals.button, state_signal))
+        .unwrap();
+    spawner
+        .spawn(connection_task(peripherals.wifi_controller))
+        .unwrap();
+    spawner.spawn(net_task(peripherals.network_runner)).unwrap();
     spawner
         .spawn(bulb_commands_task(
-            stack,
+            peripherals.network_stack,
             bulb_ip_addr_str,
             bulb_channel.receiver(),
         ))
@@ -362,17 +401,41 @@ async fn main(spawner: Spawner) {
 
 // tasks
 
+/// manages global state and routes commands to bulb
+#[embassy_executor::task]
+async fn state_manager_task(
+    state_signal: &'static StateSignal,
+    bulb_channel_sender: BulbChannelSender,
+    led_state_signal: &'static LedStateSignal,
+) {
+    let mut state = State::new();
+    
+    loop {
+        let command = state_signal.wait().await;
+        match command {
+            StateCommand::SetMarkerColor(color) => {
+                state.update_marker_color(color.clone());
+                let (h, s, b) = color.hsb();
+                bulb_channel_sender.send(TasmotaCommand::HSBColor(h, s, b)).await;
+                led_state_signal.signal(state.clone());
+            }
+            StateCommand::ClearMarkerColor => {
+                state.clear_marker_color();
+                bulb_channel_sender.send(TasmotaCommand::White(100)).await;
+                led_state_signal.signal(state.clone());
+            }
+        }
+    }
+}
+
 /// task for button press
 #[embassy_executor::task]
-async fn button_task(button: Input<'static>, bulb_channel_sender: BulbChannelSender) {
+async fn button_task(button: Input<'static>, state_signal: &'static StateSignal) {
     let mut was_pressed = false;
     loop {
         let is_pressed = button.is_low();
         if is_pressed && !was_pressed {
-            LAST_MARKER_COLOR.store(0, Ordering::Relaxed);
-            LAST_MARKER_COLOR_UPDATED_AT
-                .store(Instant::now().as_millis() as u32, Ordering::Relaxed);
-            bulb_channel_sender.send(TasmotaCommand::White(100)).await;
+            state_signal.signal(StateCommand::ClearMarkerColor);
         }
         was_pressed = is_pressed;
         Timer::after(Duration::from_millis(100)).await;
@@ -381,11 +444,18 @@ async fn button_task(button: Input<'static>, bulb_channel_sender: BulbChannelSen
 
 /// loop for managing led
 #[embassy_executor::task]
-async fn led_task(mut led: Output<'static>) {
+async fn led_task(mut led: Output<'static>, led_state_signal: &'static LedStateSignal) {
     led.set_low();
+    let mut current_state = State::new();
+    
     loop {
+        // Check for new state updates (non-blocking)
+        if let Some(new_state) = led_state_signal.try_take() {
+            current_state = new_state;
+        }
+        
         let now = Instant::now().as_millis() as u32;
-        let last_uid_at = LAST_MARKER_COLOR_UPDATED_AT.load(Ordering::Relaxed);
+        let last_uid_at = current_state.last_marker_color_updated_at;
         if now - last_uid_at < 100 || (now - last_uid_at > 200 && now - last_uid_at < 300) {
             led.set_high();
         } else {
@@ -399,7 +469,7 @@ async fn led_task(mut led: Output<'static>) {
 #[embassy_executor::task]
 async fn rfid_task(
     mut mfrc522: Mfrc522<I2cInterface<I2c<'static, Blocking>>, Initialized>,
-    bulb_channel_sender: BulbChannelSender,
+    state_signal: &'static StateSignal,
 ) {
     loop {
         if let Ok(atqa) = mfrc522.new_card_present() {
@@ -407,13 +477,7 @@ async fn rfid_task(
                 Ok(Uid::Double(inner)) => {
                     if let Some(marker_color) = MarkerColor::from_uid(&inner) {
                         info!("detected color: {}", marker_color);
-                        LAST_MARKER_COLOR.store(marker_color.clone() as u8, Ordering::Relaxed);
-                        LAST_MARKER_COLOR_UPDATED_AT
-                            .store(Instant::now().as_millis() as u32, Ordering::Relaxed);
-                        let (h, s, b) = marker_color.hsb();
-                        bulb_channel_sender
-                            .send(TasmotaCommand::HSBColor(h, s, b))
-                            .await;
+                        state_signal.signal(StateCommand::SetMarkerColor(marker_color));
                     } else {
                         info!("unknown marker uid: {}", inner.as_bytes());
                     }
