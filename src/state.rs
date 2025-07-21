@@ -57,17 +57,23 @@ pub async fn state_manager_task(
         let command = state_signal.wait().await;
         match command {
             StateCommand::SetMarkerColor(color) => {
+                let color_changed = state.last_marker_color.as_ref() != Some(&color);
                 state.update_marker_color(color.clone());
-                let (h, s, b) = color.hsb();
-                bulb_channel_sender
-                    .send(TasmotaCommand::HSBColor(h, s, b))
-                    .await;
-                led_state_signal.signal(state.clone());
+                if color_changed {
+                    let (h, s, b) = color.hsb();
+                    bulb_channel_sender
+                        .send(TasmotaCommand::HSBColor(h, s, b))
+                        .await;
+                    led_state_signal.signal(state.clone());
+                }
             }
             StateCommand::ClearMarkerColor => {
+                let had_color = state.last_marker_color.is_some();
                 state.clear_marker_color();
-                bulb_channel_sender.send(TasmotaCommand::White(100)).await;
-                led_state_signal.signal(state.clone());
+                if had_color {
+                    bulb_channel_sender.send(TasmotaCommand::White(100)).await;
+                    led_state_signal.signal(state.clone());
+                }
             }
         }
     }

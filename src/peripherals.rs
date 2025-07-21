@@ -24,11 +24,15 @@ pub struct Peripherals {
 }
 
 impl Peripherals {
+    /// initialize peripherals
     pub fn new(esp_peripherals: esp_hal::peripherals::Peripherals) -> Self {
+        info!("initializing peripherals");
+
         let timer0 = SystemTimer::new(esp_peripherals.SYSTIMER);
         esp_hal_embassy::init(timer0.alarm0);
         info!("embassy initialized");
 
+        // wifi controller
         let timer1 = TimerGroup::new(esp_peripherals.TIMG0);
         let mut rng = esp_hal::rng::Rng::new(esp_peripherals.RNG);
         let seed = rng.random().into();
@@ -56,17 +60,19 @@ impl Peripherals {
         );
         info!("wifi controller initialized");
 
+        // led
         let led: Output<'_> =
             Output::new(esp_peripherals.GPIO7, Level::Low, OutputConfig::default());
 
+        // button
         let button = Input::new(
             esp_peripherals.GPIO9,
             InputConfig::default().with_pull(Pull::Up),
         );
 
+        // rfid reader
         let sda = esp_peripherals.GPIO2;
         let scl = esp_peripherals.GPIO1;
-
         let mut i2c = match I2c::new(
             esp_peripherals.I2C0,
             Config::default().with_frequency(Rate::from_khz(I2C_FREQUENCY_KHZ)),
@@ -80,9 +86,7 @@ impl Peripherals {
                 panic!();
             }
         };
-
         i2c = i2c.with_sda(sda).with_scl(scl);
-
         let itf = I2cInterface::new(i2c, RFID_I2C_ADDRESS);
         let mut mfrc522 = Mfrc522::new(itf).init().unwrap_or_else(|e| match e {
             mfrc522::Error::Comm(c) => {
@@ -100,7 +104,6 @@ impl Peripherals {
             error!("mfrc522 version error");
             panic!();
         }
-
         match mfrc522.set_antenna_gain(mfrc522::RxGain::DB48) {
             Ok(()) => info!("antenna gain set"),
             Err(_) => {
@@ -108,6 +111,7 @@ impl Peripherals {
                 panic!();
             }
         }
+        info!("rfid reader initialized");
 
         Self {
             led,
