@@ -48,8 +48,6 @@ cargo run                      # Build and flash debug version
 cargo run --release            # Build and flash release version
 ```
 
-### Wokwi Simulation
-The project includes `wokwi.toml` for hardware simulation with Wokwi platform.
 
 ### Toolchain
 - Uses stable Rust with `riscv32imac-unknown-none-elf` target

@@ -17,7 +17,7 @@ use reqwless::request::Method;
 
 #[derive(Format, Clone)]
 pub enum TasmotaCommand {
-    HSBColor(u8, u8, u8),
+    HSBColor(u16, u8, u8),
     White(u16),
 }
 

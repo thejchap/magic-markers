@@ -16,7 +16,6 @@ pub async fn led_task(mut led: Output<'static>, led_state_signal: &'static LedSt
         if let Some(new_state) = led_state_signal.try_take() {
             current_state = new_state;
         }
-
         let now = Instant::now().as_millis() as u32;
         let last_uid_at = current_state.last_marker_color_updated_at;
         if now - last_uid_at < LED_FLASH_ON_TIME_MS

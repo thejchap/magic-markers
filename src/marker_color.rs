@@ -1,41 +1,46 @@
 use defmt::Format;
 use mfrc522::GenericUid;
 
-#[repr(u8)]
 #[derive(Debug, Format, PartialEq, Clone)]
 pub enum MarkerColor {
-    Red = 1,
-    Brown = 2,
-    BlueLagoon = 3,
-    Green = 4,
-    Black = 5,
-    SandyTan = 6,
-    Gray = 7,
-    Pink = 8,
-    Blue = 9,
-    Yellow = 10,
-    Orange = 11,
-    Violet = 12,
+    Red,
+    Brown,
+    BlueLagoon,
+    Green,
+    Black,
+    SandyTan,
+    Gray,
+    Pink,
+    Blue,
+    Yellow,
+    Orange,
+    Violet,
 }
 
 impl MarkerColor {
-    pub fn hsb(&self) -> (u8, u8, u8) {
+    /// returns the hue, saturation, and brightness values for the marker color
+    ///
+    /// h - hue. 0-360
+    /// s - saturation. 0-100
+    /// b - brightness. 0-100
+    pub fn hsb(&self) -> (u16, u8, u8) {
         match self {
-            MarkerColor::Red => (0, 255, 255),
-            MarkerColor::Brown => (30, 255, 255),
-            MarkerColor::BlueLagoon => (180, 255, 255),
-            MarkerColor::Green => (120, 255, 255),
-            MarkerColor::Black => (0, 0, 0),
-            MarkerColor::SandyTan => (30, 100, 200),
-            MarkerColor::Gray => (0, 0, 128),
-            MarkerColor::Pink => (0, 255, 255),
-            MarkerColor::Blue => (240, 255, 255),
-            MarkerColor::Yellow => (60, 255, 255),
-            MarkerColor::Orange => (30, 255, 200),
-            MarkerColor::Violet => (0, 255, 255),
+            MarkerColor::Red => (0, 100, 100),
+            MarkerColor::Brown => (30, 100, 30),
+            MarkerColor::BlueLagoon => (180, 100, 100),
+            MarkerColor::Green => (120, 100, 100),
+            MarkerColor::Black => (0, 0, 1),
+            MarkerColor::SandyTan => (30, 100, 100),
+            MarkerColor::Gray => (0, 0, 50),
+            MarkerColor::Pink => (340, 100, 100),
+            MarkerColor::Blue => (240, 100, 100),
+            MarkerColor::Yellow => (60, 100, 100),
+            MarkerColor::Orange => (30, 100, 100),
+            MarkerColor::Violet => (0, 0, 70),
         }
     }
 
+    /// maps the marker color to its rfid uid value
     pub fn uid(&self) -> [u8; 7] {
         match self {
             MarkerColor::Red => [4, 61, 60, 18, 54, 30, 145],
@@ -53,6 +58,7 @@ impl MarkerColor {
         }
     }
 
+    /// maps a rfid uid value to a marker color
     pub fn from_uid(generic_uid: &GenericUid<7>) -> Option<Self> {
         let uid = generic_uid.as_bytes();
         if uid == MarkerColor::Red.uid() {
@@ -81,27 +87,6 @@ impl MarkerColor {
             Some(MarkerColor::Violet)
         } else {
             None
-        }
-    }
-}
-
-impl TryFrom<u8> for MarkerColor {
-    type Error = ();
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(MarkerColor::Red),
-            2 => Ok(MarkerColor::Brown),
-            3 => Ok(MarkerColor::BlueLagoon),
-            4 => Ok(MarkerColor::Green),
-            5 => Ok(MarkerColor::Black),
-            6 => Ok(MarkerColor::SandyTan),
-            7 => Ok(MarkerColor::Gray),
-            8 => Ok(MarkerColor::Pink),
-            9 => Ok(MarkerColor::Blue),
-            10 => Ok(MarkerColor::Yellow),
-            11 => Ok(MarkerColor::Orange),
-            12 => Ok(MarkerColor::Violet),
-            _ => Err(()),
         }
     }
 }
