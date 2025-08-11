@@ -52,7 +52,7 @@ use magic_markers::mk_static;
 use magic_markers::networking::{connection_task, net_task};
 use magic_markers::peripherals::Peripherals;
 use magic_markers::rfid::rfid_task;
-use magic_markers::state::{state_manager_task, StateSignal};
+use magic_markers::state::{periodic_sync_task, state_manager_task, StateSignal};
 
 #[panic_handler]
 fn panic(_: &core::panic::PanicInfo) -> ! {
@@ -78,6 +78,7 @@ async fn main(spawner: Spawner) {
             led_state_signal,
         ))
         .unwrap();
+    spawner.spawn(periodic_sync_task(state_signal)).unwrap();
     spawner
         .spawn(rfid_task(peripherals.mfrc522, state_signal))
         .unwrap();
@@ -96,6 +97,7 @@ async fn main(spawner: Spawner) {
             peripherals.network_stack,
             BULB_IP_ADDRESS,
             bulb_channel.receiver(),
+            state_signal,
         ))
         .unwrap();
 }

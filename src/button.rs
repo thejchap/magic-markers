@@ -8,7 +8,7 @@ pub async fn button_task(button: Input<'static>, state_signal: &'static StateSig
     loop {
         let is_pressed = button.is_low();
         if is_pressed && !was_pressed {
-            state_signal.signal(StateCommand::ClearMarkerColor);
+            state_signal.signal(StateCommand::ToggleDimmer);
         }
         was_pressed = is_pressed;
         Timer::after(Duration::from_millis(100)).await;

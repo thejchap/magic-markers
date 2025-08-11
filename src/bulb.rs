@@ -1,6 +1,7 @@
 extern crate alloc;
 use crate::constants::{COMMAND_DELAY_MS, HTTP_BUFFER_SIZE, HTTP_TIMEOUT_SECS};
 use crate::mk_static;
+use crate::state::{StateCommand, StateSignal};
 use alloc::format;
 use core::fmt;
 use defmt::{info, warn, Format};
@@ -15,10 +16,11 @@ use embassy_time::{Duration, Timer};
 use reqwless::client::HttpClient;
 use reqwless::request::Method;
 
-#[derive(Format, Clone)]
+#[derive(Format, Clone, Debug)]
 pub enum TasmotaCommand {
     HSBColor(u16, u8, u8),
     White(u16),
+    Dimmer(u8),
 }
 
 impl fmt::Display for TasmotaCommand {
@@ -28,6 +30,7 @@ impl fmt::Display for TasmotaCommand {
                 write!(f, "hsbcolor%20{},{},{}", h, s, b)
             }
             TasmotaCommand::White(value) => write!(f, "white%20{}", value),
+            TasmotaCommand::Dimmer(value) => write!(f, "dimmer%20{}", value),
         }
     }
 }
@@ -41,6 +44,7 @@ pub async fn bulb_commands_task(
     stack: Stack<'static>,
     bulb_ip_addr_str: &'static str,
     bulb_channel_receiver: BulbChannelReceiver,
+    state_signal: &'static StateSignal,
 ) {
     info!("starting web task...");
     stack.wait_link_up().await;
@@ -64,9 +68,16 @@ pub async fn bulb_commands_task(
         HttpClient::new(tcp_client, dns_client)
     );
     let mut buffer = [0u8; HTTP_BUFFER_SIZE];
+
+    // Signal that we're ready to send commands (connected)
+    state_signal.signal(StateCommand::SetConnected(true));
+
     loop {
         let command = bulb_channel_receiver.receive().await;
-        send_bulb_command(client, &mut buffer, bulb_ip_addr_str, command).await;
+        let success = send_bulb_command(client, &mut buffer, bulb_ip_addr_str, command).await;
+
+        // Update connection status based on command success
+        state_signal.signal(StateCommand::SetConnected(success));
     }
 }
 
@@ -79,7 +90,7 @@ async fn send_bulb_command(
     buffer: &mut [u8; HTTP_BUFFER_SIZE],
     bulb_ip_addr: &str,
     command: TasmotaCommand,
-) {
+) -> bool {
     let url = format!("http://{}/cm?cmnd={}", bulb_ip_addr, command);
     let method = Method::POST;
     info!("sending request: {} {}", method, url.as_str());
@@ -88,14 +99,14 @@ async fn send_bulb_command(
         Err(e) => {
             warn!("request build error: {:?}", e);
             Timer::after(Duration::from_secs(2)).await;
-            return;
+            return false;
         }
     };
     let res = match req.send(buffer).await {
         Ok(res) => res,
         Err(e) => {
             warn!("request send error: {:?}", e);
-            return;
+            return false;
         }
     };
     info!("request sent successfully");
@@ -107,7 +118,12 @@ async fn send_bulb_command(
                 Err(_) => warn!("response body is not valid UTF-8"),
             }
         }
-        Err(e) => warn!("failed to read response body: {}", e),
+        Err(e) => {
+            warn!("failed to read response body: {}", e);
+            Timer::after(Duration::from_millis(COMMAND_DELAY_MS)).await;
+            return false;
+        }
     }
     Timer::after(Duration::from_millis(COMMAND_DELAY_MS)).await;
+    true
 }
