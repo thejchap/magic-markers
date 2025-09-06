@@ -38,6 +38,7 @@ impl State {
     pub fn update_marker_color(&mut self, color: MarkerColor) {
         self.last_marker_color = Some(color);
         self.last_marker_color_updated_at = Instant::now().as_millis() as u32;
+        self.current_dimmer_level = 100;
     }
 
     pub fn clear_marker_color(&mut self) {
@@ -121,13 +122,13 @@ pub async fn state_manager_task(
                 // Manually triggered state sync - resend intended state if we have one
                 if state.is_connected {
                     if let Some(intended_command) = &state.intended_bulb_state {
-                        info!("Syncing bulb state: {:?}", intended_command);
+                        info!("syncing bulb state: {:?}", intended_command);
                         bulb_channel_sender.send(intended_command.clone()).await;
                     } else {
-                        info!("No intended state to sync");
+                        info!("no intended state to sync");
                     }
                 } else {
-                    info!("Skipping sync - not connected to bulb");
+                    info!("skipping sync - not connected to bulb");
                 }
             }
             StateCommand::ToggleDimmer => {
@@ -136,7 +137,7 @@ pub async fn state_manager_task(
                 let command = TasmotaCommand::Dimmer(dimmer_level);
                 state.intended_bulb_state = Some(command.clone());
                 bulb_channel_sender.send(command).await;
-                info!("Toggled dimmer to: {}%", dimmer_level);
+                info!("toggled dimmer to: {}%", dimmer_level);
                 led_state_signal.signal(state.clone());
             }
         }
@@ -146,14 +147,13 @@ pub async fn state_manager_task(
 #[embassy_executor::task]
 pub async fn periodic_sync_task(state_signal: &'static StateSignal) {
     info!(
-        "Starting periodic sync task with {}s interval",
+        "starting periodic sync task with {}s interval",
         PERIODIC_SYNC_INTERVAL_SECS
     );
 
     loop {
         Timer::after(Duration::from_secs(PERIODIC_SYNC_INTERVAL_SECS)).await;
-
-        info!("Triggering periodic state sync");
+        info!("triggering periodic state sync");
         state_signal.signal(StateCommand::SyncState);
     }
 }
