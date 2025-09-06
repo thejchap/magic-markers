@@ -5,6 +5,8 @@ control an led smart bulb using a set of crayola markers! inspired by
 the main difference is that this is an entirely self-contained, open source
 project that does not require integrating with any smart home systems.
 
+https://github.com/user-attachments/assets/32f9cf9f-bd24-4c65-817b-992e0615c56a
+
 ## how it works
 
 each marker has a unique rfid tag, which is read by the nanoc6 rfid reader. the
